@@ -1,134 +1,177 @@
 """
-👁 Eye of God — OSINT Telegram Bot
-Аналог бота "Глаз Бога": поиск по нику, номеру, имени, соцсетям
+👁 Eye of God Bot — переписан на чистом aiohttp (без python-telegram-bot)
+Совместим с Python 3.13+
 """
-
 import asyncio
 import aiohttp
-import re
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
-)
-from config import BOT_TOKEN
+import json
+import os
 from searchers import (
     search_by_phone,
     search_by_username,
     search_by_name,
-    search_social_networks,
     search_email,
+    search_social_networks,
 )
 
-# ───────────────────────────── helpers ──────────────────────────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-def main_menu_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📱 Номер телефона", callback_data="mode_phone")],
-        [InlineKeyboardButton("👤 Ник / Username",  callback_data="mode_username")],
-        [InlineKeyboardButton("📛 Имя + Фамилия",   callback_data="mode_name")],
-        [InlineKeyboardButton("📧 Email",            callback_data="mode_email")],
-        [InlineKeyboardButton("🌐 Соцсети (все)",    callback_data="mode_social")],
-    ])
+# user_id -> mode
+user_modes = {}
 
-def back_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")]
-    ])
+MENU_TEXT = (
+    "👁 *Eye of God — OSINT Bot*\n\n"
+    "Выбери режим поиска:"
+)
+
+MENU_KB = {
+    "inline_keyboard": [
+        [{"text": "📱 Номер телефона", "callback_data": "mode_phone"}],
+        [{"text": "👤 Ник / Username",  "callback_data": "mode_username"}],
+        [{"text": "📛 Имя + Фамилия",   "callback_data": "mode_name"}],
+        [{"text": "📧 Email",            "callback_data": "mode_email"}],
+        [{"text": "🌐 Соцсети (все)",    "callback_data": "mode_social"}],
+    ]
+}
+
+BACK_KB = {
+    "inline_keyboard": [[{"text": "◀️ Назад", "callback_data": "back_main"}]]
+}
 
 PROMPTS = {
-    "phone":    "📱 Введи номер телефона (международный формат, например +79991234567):",
+    "phone":    "📱 Введи номер телефона (например +79991234567):",
     "username": "👤 Введи ник / username (без @):",
-    "name":     "📛 Введи Имя Фамилию (можно добавить город через запятую):",
+    "name":     "📛 Введи Имя Фамилию:",
     "email":    "📧 Введи email адрес:",
     "social":   "🌐 Введи ник для поиска по всем соцсетям:",
 }
 
-# ───────────────────────────── handlers ─────────────────────────────
+# ─────────────── API helpers ───────────────
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.clear()
-    text = (
-        "👁 *Eye of God — OSINT Bot*\n\n"
-        "Поиск информации по открытым источникам.\n"
-        "Выбери режим поиска:"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown",
-                                    reply_markup=main_menu_keyboard())
+async def api(session, method, **kwargs):
+    async with session.post(f"{API}/{method}", json=kwargs) as r:
+        return await r.json()
 
-async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+async def send(session, chat_id, text, reply_markup=None):
+    params = {
+        "chat_id": chat_id,
+        "text": text[:4096],
+        "parse_mode": "Markdown",
+    }
+    if reply_markup:
+        params["reply_markup"] = reply_markup
+    await api(session, "sendMessage", **params)
 
-    if data == "back_main":
-        ctx.user_data.clear()
-        await query.edit_message_text(
-            "👁 *Eye of God — OSINT Bot*\n\nВыбери режим поиска:",
-            parse_mode="Markdown", reply_markup=main_menu_keyboard()
-        )
+async def answer_cb(session, cb_id):
+    await api(session, "answerCallbackQuery", callback_query_id=cb_id)
+
+async def edit_msg(session, chat_id, msg_id, text, reply_markup=None):
+    params = {
+        "chat_id": chat_id,
+        "message_id": msg_id,
+        "text": text[:4096],
+        "parse_mode": "Markdown",
+    }
+    if reply_markup:
+        params["reply_markup"] = reply_markup
+    await api(session, "editMessageText", **params)
+
+async def delete_msg(session, chat_id, msg_id):
+    await api(session, "deleteMessage", chat_id=chat_id, message_id=msg_id)
+
+# ─────────────── handlers ───────────────
+
+async def handle_message(session, msg):
+    chat_id = msg["chat"]["id"]
+    text = msg.get("text", "").strip()
+
+    if text == "/start":
+        user_modes.pop(chat_id, None)
+        await send(session, chat_id, MENU_TEXT, MENU_KB)
         return
 
-    mode = data.replace("mode_", "")
-    ctx.user_data["mode"] = mode
-    await query.edit_message_text(
-        PROMPTS[mode], reply_markup=back_keyboard()
-    )
-
-async def handle_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    mode = ctx.user_data.get("mode")
+    mode = user_modes.get(chat_id)
     if not mode:
-        await start(update, ctx)
+        await send(session, chat_id, MENU_TEXT, MENU_KB)
         return
 
-    query_text = update.message.text.strip()
-    ctx.user_data.clear()
-
-    msg = await update.message.reply_text("🔍 Ищу информацию, подожди...")
+    del user_modes[chat_id]
+    wait = await api(session, "sendMessage",
+                     chat_id=chat_id, text="🔍 Ищу, подожди...")
+    wait_id = wait.get("result", {}).get("message_id")
 
     try:
         if mode == "phone":
-            result = await search_by_phone(query_text)
+            result = await search_by_phone(text)
         elif mode == "username":
-            result = await search_by_username(query_text)
+            result = await search_by_username(text)
         elif mode == "name":
-            result = await search_by_name(query_text)
+            result = await search_by_name(text)
         elif mode == "email":
-            result = await search_email(query_text)
+            result = await search_email(text)
         elif mode == "social":
-            result = await search_social_networks(query_text)
+            result = await search_social_networks(text)
         else:
             result = "❌ Неизвестный режим"
     except Exception as e:
-        result = f"❌ Ошибка при поиске: {e}"
+        result = f"❌ Ошибка: {e}"
 
-    # Telegram limit = 4096 chars
-    for chunk in split_message(result):
-        await update.message.reply_text(chunk, parse_mode="Markdown",
-                                        reply_markup=main_menu_keyboard())
-    await msg.delete()
+    if wait_id:
+        await delete_msg(session, chat_id, wait_id)
 
-def split_message(text: str, limit: int = 4000):
-    """Режем длинные ответы на части."""
-    parts = []
-    while len(text) > limit:
-        split_at = text.rfind("\n", 0, limit)
-        if split_at == -1:
-            split_at = limit
-        parts.append(text[:split_at])
-        text = text[split_at:].lstrip()
-    parts.append(text)
-    return parts
+    # Режем на куски по 4000 символов
+    for i in range(0, len(result), 4000):
+        chunk = result[i:i+4000]
+        kb = MENU_KB if i + 4000 >= len(result) else None
+        await send(session, chat_id, chunk, kb)
 
-# ───────────────────────────── main ─────────────────────────────────
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input))
-    print("👁 Eye of God запущен")
-    app.run_polling()
+async def handle_callback(session, cb):
+    chat_id = cb["message"]["chat"]["id"]
+    msg_id  = cb["message"]["message_id"]
+    data    = cb["data"]
+    cb_id   = cb["id"]
+
+    await answer_cb(session, cb_id)
+
+    if data == "back_main":
+        user_modes.pop(chat_id, None)
+        await edit_msg(session, chat_id, msg_id, MENU_TEXT, MENU_KB)
+        return
+
+    mode = data.replace("mode_", "")
+    user_modes[chat_id] = mode
+    await edit_msg(session, chat_id, msg_id, PROMPTS[mode], BACK_KB)
+
+
+# ─────────────── polling ───────────────
+
+async def main():
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN не задан!")
+        return
+
+    offset = 0
+    print("👁 Eye of God запущен (long polling)")
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                resp = await api(session, "getUpdates",
+                                 offset=offset, timeout=30,
+                                 allowed_updates=["message", "callback_query"])
+                updates = resp.get("result", [])
+                for upd in updates:
+                    offset = upd["update_id"] + 1
+                    if "message" in upd:
+                        asyncio.create_task(handle_message(session, upd["message"]))
+                    elif "callback_query" in upd:
+                        asyncio.create_task(handle_callback(session, upd["callback_query"]))
+            except Exception as e:
+                print(f"Polling error: {e}")
+                await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+        
